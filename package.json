@@ -21,6 +21,8 @@
   },
   "homepage": "https://github.com/pr0digi/jspass#readme",
   "dependencies": {
-    "commander": "^2.9.0"
+    "commander": "^2.9.0",
+    "fs": "0.0.1-security",
+    "proper-lockfile": "^2.0.0"
   }
 }
