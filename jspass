@@ -1,0 +1,604 @@
+#!/usr/bin/env node
+"use strict"
+
+const program = require("commander");
+const fs = require("fs");
+const child_process = require("child_process");
+const path = require("path");
+const readline = require("readline");
+
+if (child_process.spawnSync("which", ["gpg2"]).status == 0) {
+	Object.defineProperty(global, "GPG", { value: "gpg2" });
+}
+else if (child_process.spawnSync("which", ["gpg"]).status == 0) {
+	Object.defineProperty(global, "GPG", { value: "gpg"	});
+}
+else {
+	console.error("Cannot find GPG in system.");
+	process.exit(2);
+}
+
+let ENCRYPT_COMMAND = ["-e", "--quiet", "--yes", "--compress-algo=none", "--no-encrypt-to"];
+let DECRYPT_COMMAND = ["-d", "--quiet", "--yes", "--compress-algo=none", "--no-encrypt-to"];
+
+//check if gpg-agent is available on system, and set gpg parameters appropriately
+if (child_process.spawnSync("which", ["gpg-agent"]).status == 0) {
+	ENCRYPT_COMMAND.push("--batch", "--use-agent");
+	DECRYPT_COMMAND.push("--batch", "--use-agent");
+}
+
+//set permission for files, default read and write by user
+if (process.env.PASSWORD_STORE_UMASK) {	process.umask(process.env.PASSWORD_STORE_UMASK); }
+else { process.umask("077"); }
+
+//get store path
+let STORE_PATH = process.env.PASSWORD_STORE_DIR || process.env.HOME + '/.password-store/';
+if (!STORE_PATH.startsWith('/')) { STORE_PATH = process.env.HOME + '/' + STORE_PATH; }
+if (!STORE_PATH.endsWith('/')) { STORE_PATH += '/'; }
+
+if (process.env.PASWORD_STORE_GIT) { var PASSWORD_STORE_GIT = PASWORD_STORE_GIT; }
+
+let GIT_PATH = PASSWORD_STORE_GIT || STORE_PATH;
+
+const X_SELECTION = process.env.PASSWORD_STORE_X_SELECTION || "clipboard";
+
+program.version('0.0.1');
+
+program
+	.option('-p, --path <sub-folder>')
+	.command('init [gpgIds...]')
+	.action(initializeStore);
+
+program
+	.command('git [gitCommands...]')
+	.action(runGit);
+
+program
+	.option('-e, --echo')
+	.option('-m, --multiline')
+	.option('-f, --force')
+	.command('insert <insertPath>')
+	.alias('add')
+	.action(insertPassword);
+
+program
+	.option('-c, --clip')
+	.command('show <passName>')
+	.action(showPassword);
+
+program
+	.arguments('<passName>')
+	.action(showPassword);
+
+program
+	.command("ls <subfolder>")
+	.alias("list")
+	.action(showTree);
+
+program
+	.command("find <pattern>")
+	.alias("search")
+	.action(searchPassName);
+
+program
+	.command("mv <oldPath> <newPath>")
+	.option("-f, --force")
+	.alias("rename")
+	.action(move);
+
+program
+	.command("edit <passName>")
+	.action(editPass);
+
+try {
+	if (process.argv.length == 2) showTree();
+	else program.parse(process.argv);
+}
+catch (err) {
+	if (err.code == "EACCES") {
+		console.error("Error: cannot read/write password store directory.");
+	}
+	else throw err;
+}
+
+function generateRandomName() {
+    let name = "";
+    let possibleCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    for( var i=0; i < 10; i++ ) name += possibleCharacters.charAt(Math.floor(Math.random() * possibleCharacters.length));
+
+    return name;
+}
+
+function editPass(passName) {
+	let passPath = path.join(STORE_PATH, passName + ".gpg"), cleartext = "";
+	if (fs.existsSync(passPath)) {
+		let decryptResult = child_process.spawnSync(GPG, DECRYPT_COMMAND.concat(passPath), {stdio: [0, "pipe", 2]});
+		checkStatus(decryptResult);
+		cleartext = decryptResult.stdout.toString();
+		fs.unlink(passPath);
+	}
+
+	let tmpDir = fs.existsSync("/dev/shm") ? "/dev/shm" : process.env.TMPDIR || process.env.TMP || "/tmp";
+	let tmpFile = path.join(tmpDir, "jspass-shm-" + generateRandomName());
+
+	fs.writeFileSync(tmpFile, cleartext);
+
+	let editor = process.env.EDITOR || "editor";
+	let editorResult = child_process.spawnSync(editor, [tmpFile], {stdio: "inherit"});
+	checkStatus(editorResult);
+
+	let recipients = getRecipientsForFolder(path.dirname(passPath)).map( (recipient) => {
+		return "-r " + recipient;
+	});
+
+	let encryptResult = child_process.spawnSync(GPG, ENCRYPT_COMMAND.concat(recipients, "-o" + passPath, tmpFile), {stdio: ["pipe", 1, 2]});
+	checkStatus(encryptResult);
+
+	fs.unlink(tmpFile);
+}
+
+
+function mkdirRecursive(path) {
+	let pathParts = path.split("/");
+	path = "";
+
+	while (pathParts.length != 0) {
+		path += pathParts.shift() + "/";
+
+		if (!fs.existsSync(path) || !fs.statSync(path).isDirectory()) {
+			fs.mkdirSync(path);
+			process.stdout.write("created directory '" + path + "'\n");
+		}
+	}
+}
+
+function rmdirRecursive(dir) {
+	for (let file of fs.readdirSync(dir)) {
+		if (fs.statSync(dir + "/" + file).isDirectory()) rmdirRecursive(dir + "/" + file);
+		else fs.unlinkSync(dir + "/" + file);
+	}
+	fs.rmdirSync(dir);
+}
+
+function moveFolder(oldPath, newPath) {
+	if (fs.existsSync(newPath)) newPath = path.join(newPath, path.basename(oldPath))
+	if (newPath.endsWith("/")) newPath += path.basename(oldPath);
+
+	let oldPathLength = oldPath.length;
+	let folders = [oldPath];
+
+	if (!fs.existsSync(newPath)) {
+		//console.log("New folder:", newPath);
+		mkdirRecursive(newPath)
+	}
+	else if (fs.readdirSync(newPath).length != 0) {	console.log("Will overwrite"); }
+
+	while(folders.length != 0) {
+		let currentFolder = folders.pop();
+
+		for (let file of fs.readdirSync(currentFolder)) {
+			if (fs.statSync(path.join(currentFolder, file)).isDirectory()) {
+				let newFolder = path.join(newPath, (currentFolder + file).substring(oldPathLength));
+				mkdirRecursive(newFolder)
+				//console.log("New folder:", newFolder);
+				folders.push(path.join(currentFolder, file));
+			}
+			else {
+				let newFile = path.join(newPath, currentFolder.substring(oldPathLength), file);
+				moveFile(path.join(currentFolder, file), newFile);
+			}
+		}
+	}
+	rmdirRecursive(oldPath);
+}
+
+function moveFile(oldPath, newPath) {
+	if (fs.existsSync(newPath)) newPath = path.join(newPath, path.basename(oldPath))
+	if (newPath.endsWith("/")) newPath += path.basename(oldPath);
+
+	let content = fs.readFileSync(oldPath);
+	fs.writeFileSync(newPath, content);
+	fs.unlink(oldPath);
+}
+
+
+function checkStatus(result, errorMessage, errorCode) {
+	if (result.status != 0) {
+		if (errorMessage) console.error(errorMessage);
+		if (errorCode) process.exit(errorCode);
+		else process.exit(result.status);
+	}
+}
+
+
+function getGpgIdsFor(folder) {
+	while (1) {
+		for (let file of fs.readdirSync(folder)) {
+			if (file == ".gpg-id") {
+				let ids = fs.readFileSync(folder+"/"+file, {encoding: "utf-8"}).trim().split(" ");
+				let longIds = [];
+				for (let id of ids) {
+					let gpgResult = child_process.spawnSync(GPG, ["--list-keys", "--keyid-format", "long", id], {stdio: [1, "pipe", 2]});
+					checkStatus(gpgResult);
+					let regex = /sub\W+\w+\/([a-fA-F0-9]{16})\W\d+-\d+-\d+\W\[E\]/;
+					longIds.push(regex.exec(gpgResult.stdout.toString())[1]);
+				}
+				return longIds;
+			}
+		}
+		folder += "/.."
+	}
+}
+
+
+function gpgArraysEqual(array1, array2) {
+	if (array1.length != array2.length) return false;
+	for (let id1 of array1) {
+		if (!array2.some( (id2) => { return id1 == id2; })) return false;
+	}
+	return true;
+}
+
+
+function reencryptFolder(folder, newIds) {
+	let folders = [folder];
+	while (folders.length != 0) {
+		folder = folders.pop();
+
+		if (folderHasGpgIds(folder)) continue;
+		for (let file of fs.readdirSync(folder)) {
+			if (fs.statSync(folder + "/" + file).isDirectory()) folders.push(folder + "/" + file);
+			else if (file.endsWith(".gpg")) {
+				reencryptPassword(folder + "/" + file, newIds);
+			}
+		}
+	}
+}
+
+
+function reencryptPassword(filePath, newIds) {
+	process.stdout.write(filePath.substring(STORE_PATH.length).replace(".gpg", "") + ": reencrypting to " + newIds.join(" ") + "\n");
+
+	newIds = newIds.map( (id) => { return "-r" +id });
+	let decryptResult = child_process.spawnSync(GPG, DECRYPT_COMMAND.concat(filePath));
+	checkStatus(decryptResult);
+
+	decryptResult = decryptResult.stdout.toString();
+	let encryptResult = child_process.spawnSync(GPG, ENCRYPT_COMMAND.concat(newIds, "-o" + filePath), {stdio: ["pipe", 1, 2], input: decryptResult});
+	checkStatus(encryptResult);
+}
+
+function move(oldPath, newPath) {
+	let oldName = oldPath, newName = newPath;
+	oldPath = path.normalize(STORE_PATH + oldPath);
+	newPath = path.normalize(STORE_PATH + newPath);
+	let newDir, newIds;
+
+	if (!fs.existsSync(oldPath)) { //file is password
+		if (fs.existsSync(oldPath + ".gpg")) oldPath += ".gpg";
+		else if (fs.existsSync(oldPath.substring(0, oldPath.length - 1) + ".gpg")) oldPath = oldPath.substring(0, oldPath.length - 1) + ".gpg";
+		else {
+			console.error("Error:", oldName, "is not in the password store.");
+			process.exit(1);
+		}
+	}
+
+	//console.log(oldPath, newPath);
+
+	if (!fs.existsSync(newPath)) { //target doesn't exists
+		if (!newPath.endsWith("/")) {
+			if (oldPath.endsWith(".gpg")) {
+				newPath += ".gpg";
+				if (!fs.existsSync(path.dirname(newPath))) newDir = path.dirname(newPath);
+				else newIds = getGpgIdsFor(path.dirname(newPath));
+			}
+			else if (!fs.existsSync(path.dirname(newPath))) newDir = path.dirname(newPath);
+			else newIds = getGpgIdsFor(path.dirname(newPath));
+		}
+		else { 
+			newName = path.basename(oldPath);
+			newDir = newPath; }
+	}
+	else {
+		newName = path.join(newName, path.basename(oldPath, ".gpg"));
+		newIds = getGpgIdsFor(newPath);
+	}
+
+	if (newDir) {
+		mkdirRecursive(newDir);
+		newIds = getGpgIdsFor(newDir);
+	}
+
+	let oldIds;
+
+	if (oldPath.endsWith(".gpg")) oldIds = getGpgIdsFor(path.dirname(oldPath));
+	else oldIds = getGpgIdsFor(oldPath);
+
+
+	//console.log(oldIds, newIds);
+	//console.log(gpgArraysEqual(oldIds, newIds));
+	//console.log(oldName, newName);
+
+	if (!gpgArraysEqual(oldIds, newIds)) {
+		if (oldPath.endsWith(".gpg")) reencryptPassword(oldPath, newIds);
+		else reencryptFolder(oldPath, newIds);
+	}
+
+	let moveResult;
+	if (program.force) moveResult = child_process.spawnSync("mv", ["-v", oldPath, newPath], {stdio: "inherit"});
+	else moveResult = child_process.spawnSync("mv", ["-vi", oldPath, newPath], {stdio: "inherit"});
+	checkStatus(moveResult);
+
+	//moveFolder(oldPath, newPath);
+	
+	let commitPath = path.join(STORE_PATH + newName);
+	if (oldPath.endsWith(".gpg")) commitPath += ".gpg";
+
+	//console.log(commitPath);
+
+	addFilesToGit("Move/rename " + oldName + " to " + newName + ".", commitPath);
+
+	process.exit(0);
+}
+
+function searchPassName(pattern) {
+	let searchResult = child_process.spawnSync("tree", ["-C", "-l", "--noreport", "-P", "*" + pattern + "*", "--prune", "--matchdirs", "--ignore-case", STORE_PATH]);
+	checkStatus(searchResult);
+
+	searchResult = searchResult.stdout.toString();
+	searchResult = searchResult.replace(/^.*\n/g, "");
+	searchResult = searchResult.replace(/\.gpg$/gm, "");
+
+	console.log("Search terms:", pattern);
+	process.stdout.write(searchResult);
+	process.exit(0);
+}
+
+function showTree(subfolder) {
+	if (typeof subfolder == "undefined") var subfolder = "";
+	
+	if (!fs.existsSync(STORE_PATH + subfolder)) {
+		console.error("Error: " + subfolder + " is not in the password store.");
+		process.exit(3);
+	}
+
+	let treeResult = child_process.spawnSync("tree", ["-C", "-l", "--noreport", STORE_PATH + subfolder], {stdio: ["pipe", "pipe", 2]});
+	checkStatus(treeResult);
+
+	let tree = treeResult.stdout.toString().replace(/\.gpg$/gm, "");
+	tree = tree.replace(/^.*\n/, "");
+	
+	if (!subfolder) process.stdout.write("Password store\n");
+	else process.stdout.write(subfolder + "\n");
+
+	process.stdout.write(tree);
+}
+
+function showPassword(passName) {
+	if (!fs.existsSync(STORE_PATH + passName + ".gpg")) {
+		if (fs.existsSync(STORE_PATH + passName)) {
+			showTree(passName);
+			process.exit(0);
+		}
+		console.error("Error:", path.basename(passName), "is not in the password store.");
+		process.exit(1);
+	}
+
+	let decryptResult = child_process.spawnSync(GPG, DECRYPT_COMMAND.concat(STORE_PATH + passName + ".gpg"), {stdio: [1, "pipe", 2]});
+	if (decryptResult.status != 0) process.exit(decryptResult.status);
+
+	if (program.clip) {
+		let xclipResult = child_process.spawnSync("xclip", ["-o", "-selection", "clipboard"]);
+		checkStatus(xclipResult, "Error: cannot read current clipboard content.");
+
+		let clipboardRestoreWorker = child_process.fork(__dirname + "/restore_clipboard.js", [xclipResult.stdout.toString()]);
+		clipboardRestoreWorker.on("error", (err) => {
+			console.error("Error: cannot create worker for clipboard restoration.");
+			console.error(err);
+			process.exit(2);
+		});
+
+		let password = decryptResult.stdout.toString();
+		password = password.substring(0, password.search("\n"));
+
+		xclipResult = child_process.spawnSync("xclip", ["-selection", X_SELECTION], {stdio: ["pipe", "ignore", "ignore"], input: password});
+		checkStatus(xclipResult, "Error: cannot write password to clipboard.");
+
+		let clipTime = process.env.PASSWORD_STORE_CLIP_TIME || 45;
+
+		process.stdout.write("Copied " + path.basename(passName) + " to clipboard. Will clear in " + clipTime + " seconds.\n");
+		process.exit(0);
+	}
+
+	process.stdout.write(decryptResult.stdout.toString());
+	process.exit(0);
+}
+
+function insertPassword(insertPath) {
+	mkdirRecursive(STORE_PATH + path.dirname(insertPath));
+
+	if (fs.existsSync(STORE_PATH + insertPath + '.gpg')) {
+		if (!program.force) {
+			process.stdout.write("An entry already exists for " + path.basename(insertPath) + ". Overwrite it? [y/N] ");
+
+			process.stdin.on('data', (chunk) => {
+				chunk = chunk.toString()[0];
+				if (chunk == "y" || chunk == "Y") {
+					process.stdin.removeListener("data", process.stdin.listeners("data")[0]);
+					typePassword(insertPath);
+				}
+				if (chunk == "n" || chunk == "N") { process.exit(0); }
+			});
+		}
+	}
+	else {
+		typePassword(insertPath);
+	}
+}
+
+function typePassword(insertPath) {
+	let password = "";
+	if (program.multiline) {
+		process.stdout.write("Enter contents of " + path.basename(insertPath) + " and press Ctrl+D when finished.\n");
+		process.stdin.on("data", (chunk) => { password += chunk; });
+		process.stdin.on("end", () => { savePassword(insertPath, password); });
+	}
+	else {
+		process.stdout.write("Enter password for " + path.basename(insertPath) + ": ");
+		process.stdin.setRawMode(true);
+		readline.emitKeypressEvents(process.stdin);
+		process.stdin.on("keypress", (char, key) => {
+			password += char;
+			if (key && key.name == "return") {
+				process.stdin.removeListener("keypress", process.stdin.listeners("keypress")[0]);
+				retypePassword(insertPath, password)
+			}
+			else if (key && key.ctrl && key.name == "c") process.exit(0);
+		});
+	}
+}
+
+function retypePassword(insertPath, password) {
+	process.stdout.write("\nRetype password for " + path.basename(insertPath) + ": ");
+	let retypedPassword = "";
+	process.stdin.on("keypress", (char, key) => {
+		retypedPassword += char;
+		if (key && key.name == "return") {
+			if (password == retypedPassword) {
+				process.stdout.write("\n");
+				savePassword(insertPath, password);
+				process.exit(0);
+			}
+			else {
+				process.stdout.write("\nError: the entered passwords do not match.\n");
+				process.stdin.removeListener("keypress", process.stdin.listeners("keypress")[0]);
+				typePassword(insertPath);
+			}
+		}
+		else if (key && key.ctrl && key.name == "c") process.exit(0);
+	});
+}
+
+function savePassword(insertPath, password) {
+	let recipients = getRecipientsForFolder(path.dirname(STORE_PATH + insertPath)).map( (recipient) => {
+		return "-r " + recipient;
+	});
+
+	password = password.trim() + "\n";
+	let gpgResult = child_process.spawnSync(GPG, ENCRYPT_COMMAND.concat(recipients, "-o" + STORE_PATH + insertPath + ".gpg"), {stdio: ["pipe", 1, 2], input: password});
+	checkStatus(gpgResult);
+
+	addFilesToGit("Add given password for " + path.basename(insertPath) + " to store.", STORE_PATH+insertPath + ".gpg");
+}
+
+function getRecipientsForFolder(folderPath) {
+	let currentPath = folderPath;
+	while (currentPath != "/") {
+		for (let file of fs.readdirSync(currentPath)) {
+			if (file == ".gpg-id") {
+				return fs.readFileSync(currentPath + '/' + file, {encoding: "utf-8"}).trim().split(" ");
+			}
+		}
+	}
+	return;
+}
+
+/*
+	Initialize new password store. If there are files, reencrypt them using specified keys.
+*/
+function initializeStore(gpgIds) {
+	if (program.path) {
+		if (program.path.startsWith('/')) { program.path = program.path.slice(1); }
+		STORE_PATH += program.path;
+		if (!STORE_PATH.endsWith('/')) { STORE_PATH += '/'; }
+	}
+
+	if (gpgIds.length == 0) {
+		console.log("Usage: jspass init [--path=subfolder,-p subfolder] gpg-id...");
+		process.exit(1);
+	}
+
+	mkdirRecursive(STORE_PATH);
+
+	let remainingFolders = [STORE_PATH];
+
+	const [RECIPIENTS, LONG_IDS] = getRecipientsAndLongIds(gpgIds);
+
+	while (remainingFolders.length > 0) {
+		let currentPath = remainingFolders.pop();
+		let currentFiles = fs.readdirSync(currentPath);
+
+		for (let file of currentFiles) {
+			if (fs.statSync(currentPath+file).isFile() && file.endsWith('.gpg')) {
+				let decryptResult = child_process.spawnSync(GPG, DECRYPT_COMMAND.concat([currentPath+file]), {stdio: [0, 'pipe', 2]});
+				checkStatus(decryptResult);
+
+				let cleartext = decryptResult.stdout.toString();
+
+				console.log(file.split(".gpg")[0] + ": reencrypting to " + LONG_IDS);
+				//console.log(ENCRYPT_COMMAND.concat(['-o' + currentPath+file], RECIPIENTS))								
+				let encryptResult = child_process.spawnSync(GPG, ENCRYPT_COMMAND.concat(['-o' + currentPath+file], RECIPIENTS), {stdio: ['pipe', 'pipe', 2], input: cleartext});
+				checkStatus(encryptResult);
+			}
+			else if (fs.statSync(currentPath+file).isDirectory() && !folderHasGpgIds(currentPath + file + '/')) {
+				remainingFolders.push(currentPath + file + '/');
+			}
+		}
+	}
+
+	fs.writeFileSync(STORE_PATH + '.gpg-id', gpgIds.join('\n') + '\n');
+	addFilesToGit("Reencrypt password store using new GPG id " +  gpgIds.join(', '));
+	console.log("Password store initialized for " + gpgIds.join(', '));
+}
+
+function folderHasGpgIds (path) {
+	for (let file of fs.readdirSync(path)) {
+		if (file == ".gpg-id") { return true; }
+	}
+	return false;
+}
+
+
+function getRecipientsAndLongIds(gpgIds) {
+	if (process.env.PASSWORD_STORE_KEY) { gpgIds = process.env.PASSWORD_STORE_KEY.split(" ");	}
+	
+	let recipients = gpgIds.map( (id) => { return "-r " + id; } );
+
+	let gpgResult = child_process.spawnSync(GPG, ["--list-public-keys", "--keyid-format", "long"].concat(gpgIds));
+	checkStatus(gpgResult);
+
+	let regex = /sub\W+\w+\/(\w+)\W\d+-\d+-\d+\W\[E\]/g,
+			recipient,
+			longIds = "";
+
+	while (recipient = regex.exec(gpgResult.stdout.toString())) {	longIds += recipient[1] + " ";	}
+
+	return [recipients, longIds];
+}
+
+function isGitDirectory(path) {
+	return fs.readdirSync(GIT_PATH).some( (file) => { return file == ".git" && fs.statSync(GIT_PATH + ".git").isDirectory() });
+}
+
+function addFilesToGit(commitMessage, path) {
+	if (!isGitDirectory(GIT_PATH)) { return; }
+
+	let gitResult = child_process.spawnSync("git", ["-C", GIT_PATH, "add", path], {stdio: "inherit"});
+	checkStatus(gitResult);
+	gitResult = child_process.spawnSync("git", ["-C", GIT_PATH, "commit", "-m", commitMessage], {stdio: "inherit"});
+	checkStatus(gitResult);
+}
+
+function runGit(gitCommands) {
+	let gitResult = child_process.spawnSync("git", ["-C", GIT_PATH].concat(gitCommands), {stdio: "inherit"});
+	checkStatus(gitResult);
+
+	if (gitCommands[0] == "init") {
+		if (!isGitDirectory(GIT_PATH)) {
+			addFilesToGit("Add current contents of password store.", STORE_PATH);		
+			fs.writeFileSync(STORE_PATH + '.gitattributes', "*.gpg diff=gpg");
+			addFilesToGit("Configure git repository for gpg file diff.", STORE_PATH + "/.gitattributes");
+		}
+	}
+}
